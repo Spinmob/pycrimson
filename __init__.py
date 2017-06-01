@@ -5,31 +5,32 @@ import thread      as _thread
 import time        as _time
 import numpy       as _n
 
-import spinmob     as _s
-import spinmob.egg as _egg
-
-class data_buffer(_gr.sync_block):
+class _data_buffer(_gr.sync_block):
     """
-    docstring for block data_buffer
+    A simple GNU Radio data buffer.
     """
-    def __init__(self, size=100000):
+    
+    def __init__(self, size=1000, channels=2):
         """
-        Create a data buffer that will hold "size" number of packets 
-        (346 samples each packet, when "payload" is set to 1400).
+        Thread-safe data buffer that will hold the number of data packets
+        specified by "size" in the specified number of channels (size can be
+        an integer or list of sizes, one for each channel).
         """
         
-        _gr.sync_block.__init__(self, name="data_buffer", in_sig=[(_n.int16,2)], out_sig=None)
-        
-        # Save this for size checking
-        self._size = size        
-        self._size_lock = _thread.allocate_lock()        
+        # Initialize the base object
+        _gr.sync_block.__init__(self, name="_data_buffer", 
+                in_sig=[(_n.int16,2)]*channels, out_sig=None)
         
         # Create the buffer
-        self._buffer  = []
+        self._buffer  = [[]]*channels
         self._buffer_lock = _thread.allocate_lock()
+
+        # Save this for size checking
+        self._size_lock = _thread.allocate_lock()                
+        self.set_size(size)        
         
         # Flag for whether the buffer has overrun since the last reset 
-        self._buffer_overruns = 0
+        self._buffer_overruns = [0]*self.get_channels()
         self._buffer_overruns_lock = _thread.allocate_lock()
         
     
@@ -37,80 +38,162 @@ class data_buffer(_gr.sync_block):
         """
         Returns the number of packets currently in the buffer.
         """
+        Ns = []
         self._buffer_lock.acquire()
-        N = len(self._buffer)
+        for n in range(self.get_channels()): Ns.append(len(self._buffer[n]))
         self._buffer_lock.release()
-        return N
+        return Ns
+    
+    def _at_least_n_packets(self, packets, n=1):
+        """
+        Checks the supplied packet list to make sure there is at least n
+        packets in each channel. n can be an integer or list of integers
+        (one for each channel).
+        """
+        # Make sure we have a number for each channel
+        if not type(n)==list: n = [n]*self.get_channels()        
+
+        # Check each channel        
+        for i in range(len(packets)): 
+            if len(packets[i]) < n[i]: return False
+        return True
     
     def flush_buffer(self):
         """
         Clears the buffer.
         """
         self._buffer_lock.acquire()
-        self._buffer = []
+        self._buffer = [[]]*self.get_channels()
         self._buffer_lock.release()
         
         self._buffer_overruns_lock.acquire()
-        self._buffer_overruns = 0
+        self._buffer_overruns = [0]*self.get_channels()
         self._buffer_overruns_lock.release()        
 
-    def get_overruns(self):
+    def get_channels(self): 
         """
-        Returns the number of overruns.
+        Returns the number of channels.
+        """
+        return len(self._buffer)
+
+    def get_overruns(self, reset=False):
+        """
+        Returns the number of overruns. If specified, resets the overrun
+        counts to zero.
         """
         self._buffer_overruns_lock.acquire()
-        x = self._buffer_overruns
+        
+        # Make a copy to avoid referencing issues
+        x = list(self._buffer_overruns)
+        if reset: self._buffer_overruns = [0]*self.get_channels()
+        
         self._buffer_overruns_lock.release()     
+        
         return x
     
-    def get_packets(self, min_samples=1, timeout=1.0):
+    def get_packets(self, samples=1, keep_all=False, timeout=1.0):
         """
-        Waits for enough packets to cover min_samples (or the timeout), then 
-        returns all packets, and the number of overruns, clearing the buffer
-        and resetting the overrun count.
+        Waits for enough packets to have at least the specified number of 
+        samples (or the timeout), then returns all packets, the number of 
+        overruns for each channel, and the timeout status (True for timeout), 
+        clearing the buffer and resetting the overrun count.
         
-        min_samples     specifies the minimum number of samples to wait for.
-        timeout         specifies the "give up" time
+        samples       Specifies the minimum number of samples to wait for.
+                      Can also be a list of numbers matching the number of
+                      channels.
+        
+        keep_all      If False, this will keep only the newest packets
+                      such that there are at least the specified number of 
+                      samples. If True, returns whatever was in the buffer
+                      (this is ideal for taking long continuous data).
+        
+        timeout       Specifies the "give up" time
         """
+
+        # Make sure there is a number for each channel.
+        if not type(samples) == list: samples = [samples]*self.get_channels()
+
+        # Idiot proofing
+        if not len(samples) == self.get_channels():
+            print "ERROR get_packets(): length of samples is not equal to the number of channels."
         
         t0 = _time.time()
-        packets = []
+        packets = [[]]*self.get_channels()
+
+        # Timeout flag
+        timeout_reached = False        
         
         # Wait until we get (at least) our first packet
-        while _time.time()-t0 < timeout and len(packets) == 0: 
+        while _time.time()-t0 < timeout and not self._at_least_n_packets(packets,1): 
             
-            # Return all data and clear the buffer
             self._buffer_lock.acquire()
-            packets = packets + self._buffer
-            self._buffer = []
+            
+            # Append all data from each channel and clear the buffer
+            for n in range(self.get_channels()): 
+                packets[n] = packets[n] + self._buffer[n]
+                self._buffer[n] = []
+
             self._buffer_lock.release()
+
+            # Save some cpu cycles
             _time.sleep(0.001)
         
-        # Now that we know the size of a packet, wait for the specified number
-        # of samples.
-        while _time.time()-t0 < timeout and len(packets)*len(packets[0]) < min_samples: 
+        # Find required number of packets
+        packet_counts = []
+        for n in range(len(packets)):
+            packet_counts.append(int(_n.ceil(1.0*samples[n]/len(packets[n][0]))))        
+        
+        # Now we can find the size of the packets, so wait for the specified 
+        # number of samples.
+        while _time.time()-t0 < timeout and not self._at_least_n_packets(packets, packet_counts): 
+            
+            self._buffer_lock.acquire()
             
             # Return all data and clear the buffer
-            self._buffer_lock.acquire()
-            packets = packets + self._buffer
-            self._buffer = []
+            packets[n] = packets[n] + self._buffer[n]
+            self._buffer[n] = []
+
             self._buffer_lock.release()
+
+            # Save some cpu cycles
             _time.sleep(0.001)
 
-        if _time.time()-t0 >= timeout: print "WARNING: get_packets() timeout"
-        
-        # Return the number of overruns and reset
-        self._buffer_overruns_lock.acquire()
-        overruns = self._buffer_overruns
-        self._buffer_overruns = 0
-        self._buffer_overruns_lock.release()
+        # Get the number of overruns and reset
+        overruns = self.get_overruns(True)
 
-        return packets, overruns
+        # Throw away extras if we're supposed to
+        if not keep_all: 
+            for n in range(len(packets)):            
+                
+                # Keep the most recent                
+                packets[n] = packets[n][len(packets[n])-packet_counts[n]:]
+
+        # If we reached the timeout
+        if _time.time()-t0 >= timeout: 
+            print "WARNING: get_packets() timeout"
+            timeout_reached = True
+
+        return packets, overruns, timeout_reached
+
+    def reset_overruns(self):
+        """
+        Sets the number of overruns to zero.
+        """
+        self.get_overruns(True)
 
     def set_size(self, size):
         """
-        Changes the size of the buffer.
+        Changes the size of the buffer; size can be an integer or list of sizes,
+        one for each channel.
         """
+        # Make sure we have a size for each channel
+        if not type(size)==list: size = [size]*self.get_channels()
+
+        # Idiot proofing
+        if not len(size) == self.get_channels():
+            print "ERROR set_size(): size list length doesn't match number of channels."
+            return
+        
         self._size_lock.acquire()
         self._size = size
         self._size_lock.release()
@@ -120,7 +203,7 @@ class data_buffer(_gr.sync_block):
         Returns the maximum size of the buffer.
         """
         self._size_lock.acquire()
-        x = self._size
+        x = list(self._size)
         self._size_lock.release()
         return x
 
@@ -128,340 +211,158 @@ class data_buffer(_gr.sync_block):
         
         # Acquire the buffer lock for the whole function.
         self._buffer_lock.acquire()
-        
-        # Append the new data
-        self._buffer.append(_n.array(input_items[0]))
-        
-        # If we've overrun
-        self._size_lock.acquire()
-        while len(self._buffer) > self._size:
 
-            # Remove the oldest data point            
-            self._buffer.pop()
+        # Loop over channels        
+        for n in range(len(input_items)):
             
-            # Increment the overrun
-            self._buffer_overruns_lock.acquire()
-            self._buffer_overruns += 1
-            self._buffer_overruns_lock.release()
+            # Append the new data
+            self._buffer[n].append(_n.array(input_items[n]))
+
+            self._size_lock.acquire()
+        
+            # If we've overrun
+            while len(self._buffer[n]) > self._size[n]:
+    
+                # Remove the oldest data point            
+                self._buffer[n].pop()
+                
+                # Increment the overrun
+                self._buffer_overruns_lock.acquire()
+                self._buffer_overruns[n] += 1
+                self._buffer_overruns_lock.release()
+            
+            self._size_lock.release()
         
         # release the buffer lock
         self._buffer_lock.release()        
-        self._size_lock.release()
         
-        return len(input_items[0])
+        return 1
 
+class crimson():
+    """
+    Interface to the Crimson. Typical workflow:
+    
+    c = crimson()
+    
+    c.enable_rx_channels([0,1])
 
-class jax_data_streamer():
+    c.start()
 
-    # Buffer to hold all the data    
-    buffer = data_buffer(10000)
-    get_packets = buffer.get_packets
+    c.get_packets()
+    """
     
     def __init__(self):
+        """
+        Interface to the Crimson. Typical workflow:
+        
+        c = crimson()
+        c.enable_rx_channels([0,1])
+        c.start()
+        c.get_packets()
+        """
+        self._enabled_rx_channels = None
+        self.buffer               = None
+        self._top_block           = None
+        self._crimson             = None
+        
+        return        
+        
+    def enable_rx_channels(self, channels=[0,1], buffer_size=500):
+        """
+        Enables the specified channels.
+        
+        Behind the scenes, this creates a top block and a GNU radio UHD 
+        usrp_source object, then connects the usrp_source to a data buffer 
+        (stored in self.buffer).
+        """
+        # Stop and clear any old processes
+        if not self._top_block == None: 
+            self._top_block.lock()            
+            self._top_block.stop()
+        
+        # Store for safe keeping
+        self._enabled_rx_channels = channels        
+        
+        # Create the buffer
+        self.buffer = _data_buffer(500, len(channels))
         
         # Create the gnuradio top block
-        self._top_block = _gr.top_block("Data Streamer")        
-        
-        # Create the faucet from the Crimson
+        self._top_block = _gr.top_block("Crimson")
+
+        # Create the crimson data faucet        
         self._crimson = _uhd.usrp_source("crimson",
-        	_uhd.stream_args(cpu_format="sc16", args='sc16', channels=([0])))
+        	_uhd.stream_args(cpu_format="sc16", args='sc16', channels=(channels)))
         
-        # Buffer defined above the __init__        
         # Connect the faucet to the buffer
-        self._top_block.connect((self._crimson, 0), (self.buffer, 0))
+        for n in range(len(channels)):
+            self._top_block.connect((self._crimson, n), (self.buffer, n))
 
-        # Build the gui, load previous settings, connect signals
-        self._build_gui()
-        
-        # Update settings from the Crimson itself
-        self._get_settings_from_crimson()      
+    def get_enabled_rx_channels(self):
+        """
+        Returns the list of enabled rx channels.
+        """
+        return self._enabled_rx_channels
     
-        # Set the buffer size
-        self.buffer.set_size(self.settings['Software/buffer_size'])        
-        
-        # Show it!
-        self.show()
-        
-        # Start the crimson.
-        self._top_block.start()
-        
-        # Start the collection timer
-        self.timer_collect.start()
-    
-    def _build_gui(self):
+    def get_samples(self, N=1024, keep_all=False, timeout=1.0):
         """
-        Places all the controls and plots etc, loads previous config.
-        """        
-        # Embeddable docker to hold GUI stuff
-        self.docker = _egg.gui.Docker('RXA via Buffer', autosettings_path='rxa_via_buffer_window')
+        Gets the most recent N samples from each channel, plus a list of 
+        overrun counts for each. Resets the overrun counts. Return format:
         
-        # Top controls
-        self.g_top = self.docker.place_object(_egg.gui.GridLayout(False))
-        self.b_collect       = self.g_top.place_object(_egg.gui.Button('Collect Data!' , True, True))
-        self.b_trigger       = self.g_top.place_object(_egg.gui.Button('Trigger',        True, False))        
-        self.b_reset         = self.g_top.place_object(_egg.gui.Button('Reset'))
-        self.n_trace_counter = self.g_top.place_object(_egg.gui.NumberBox(0))
-        self.n_psd_counter   = self.g_top.place_object(_egg.gui.NumberBox(0))
+        [(X0,Y0,overruns0), (X1,Y1,overruns1), ...]
         
-        # button functions
-        self.b_collect.signal_clicked.connect(self._b_collect_clicked)
-        self.b_reset.signal_clicked.connect(self._b_reset_clicked)
+        N           Number of samples to get from each channel. Can be an 
+                    integer or a list of integers (one for each channel).
         
-        # Data collection timer
-        self.timer_collect = _egg.pyqtgraph.QtCore.QTimer()
-        self.timer_collect.setInterval(1)
-        self.timer_collect.timeout.connect(self._timer_collect_tick)
-        
-        # Create Settings tree and parameters
-        self.docker.new_autorow()
-        self.g_stuff = self.docker.place_object(_egg.gui.GridLayout(False), alignment=0)
-        self.settings = self.g_stuff.place_object(_egg.gui.TreeDictionary('rxa_via_buffer_settings')).set_width(300)       
-        self.settings.add_parameter('Crimson/sample_rate',      1e6,  type='float', limits=(1e4,325e6), decimals=12, suffix='Hz', siPrefix=True, dec=True)
-        self.settings.add_parameter('Crimson/center_frequency', 7e6,  type='float', limits=(0,6e9),     decimals=12, suffix='Hz', siPrefix=True, step=0.1e6)
-        #self.settings.add_parameter('bandwidth',        1e5, type='float', limits=(0,325e6/2), decimals=12, suffix='Hz', siPrefix=True)        
-        self.settings.add_parameter('Crimson/gain',             0,    type='float', limits=(0,31.5), step=0.5,    suffix=' dB')
-        self.settings.add_parameter('Crimson/settle_time',      1e-3, type='float', limits=(0,None), dec=True, suffix='s', siPrefix=True)      
-        self.settings.add_parameter('Software/buffer_size',      1e3, type='int',   limits=(1,None), suffix=' packets', dec=True)
-        self.settings.add_parameter('Software/voltage_cal',2.053e-05, type='float')
-        self.settings.add_parameter('Software/sample_time',     0.01, type='float', limits=(1e-6,None), suffix='s', siPrefix=True, dec=True)
-        self.settings.add_parameter('Software/PSD_enabled',    False, type='bool')        
-        self.settings.add_parameter('Software/PSD_averages',       0, type='float')
-        self.settings.add_parameter('Software/PSD_window',     "none",type='str')
-        self.settings.add_parameter('Software/PSD_pow2',       True,  type='bool')
-
-        # Load and set previous settings (if any)        
-        self.settings.load()
-        
-        # Set it up so that any changes are sent to the Crimson
-        self.settings.connect_signal_changed('Crimson/sample_rate',      self._settings_sample_rate_changed)
-        self.settings.connect_signal_changed('Crimson/center_frequency', self._settings_center_frequency_changed)
-        #self.settings.connect_signal_changed('bandwidth',        self._settings_bandwidth_changed)
-        self.settings.connect_signal_changed('Crimson/gain',             self._settings_gain_changed)
-        self.settings.connect_signal_changed('Software/buffer_size',     self._settings_buffer_size_changed)
-        
-        # for saving
-        self.settings.connect_any_signal_changed(self._any_setting_changed)
-
-        # Plotter tabs
-        self.tabs_plots = self.g_stuff.place_object(_egg.gui.TabArea(False, 'rxa_via_buffer_tabs_plots'), alignment=0)
-        
-        # Raw time trace    
-        self.tab_raw = self.tabs_plots.add_tab('Raw')                
-        self.p_raw = self.tab_raw.place_object(_egg.gui.DataboxPlot("*.txt", "rxa_via_buffer_p_raw"), alignment=0)
-        self.p_raw_trigger_level = _egg.pyqtgraph.InfiniteLine(0, movable=True, angle=0)
-        self.p_raw.ROIs.append([self.p_raw_trigger_level])
-        self.p_raw.load_gui_settings()
-        
-        # "Calibrated" time trace
-        self.tab_volts = self.tabs_plots.add_tab('Volts')
-        self.p_volts   = self.tab_volts.place_object(_egg.gui.DataboxPlot("*.txt", "rxa_via_buffer_p_volts"), alignment=0)
-        
-        # PSD
-        self.tab_psd = self.tabs_plots.add_tab('PSD')        
-        self.p_psd   = self.tab_psd.place_object(_egg.gui.DataboxPlot("*.txt", "rxa_via_buffer_p_psd"), alignment=0)
-        
-        # Info grid
-        self.docker.new_autorow()
-        self.g_bottom = self.docker.place_object(_egg.gui.GridLayout(False))        
-        self.pb_buffer       = self.g_bottom.place_object(_egg.pyqtgraph.QtGui.QProgressBar())        
-        self.b_overrun       = self.g_bottom.place_object(_egg.gui.Button('Buffer Overrun', True))
-        
-        # load last selected tab
-        self.tabs_plots.load_gui_settings()
-
-    def _any_setting_changed(self, *a): 
-        
-        # Reset the PSD averages and save the settings
-        self.reset_acquisition()        
-        self.settings.save()
-
-    def _b_collect_clicked(self, *a):
-        
-        # If we're taking new data, reset the PSD, flush the buffer, reset the overrun        
-        if self.b_collect.is_checked(): self.reset_acquisition()
-            
-    def _b_reset_clicked(self, *a): 
-        self.reset_acquisition()
-
-    def _get_settings_from_crimson(self):
+        keep_all    If True, this will return all the data from the buffer,
+                    not just the most recent N samples. Use this option if you
+                    need to take long continuous blocks of data or want to 
+                    maximize your duty cycle.
+                    
+        timeout     Number of seconds to wait for the N samples.
         """
-        Asks the crimson what all the settings currently are, and updates
-        the GUI. This also blocks all user-defined signals for changing the GUI.
-        """
-        self.settings.set_value('Crimson/sample_rate',      self._crimson.get_samp_rate(),   True)
-        self.settings.set_value('Crimson/center_frequency', self._crimson.get_center_freq(), True)
-        self.settings.set_value('Crimson/gain',   (126-self._crimson.get_gain())/4,          True)
+        # Make sure we have a sample number for each channel
+        if not type(N) == list: N = [N]*len(self.get_enabled_rx_channels())
         
+        # Idiot proof
+        if not len(N) == len(self.get_enabled_rx_channels()):
+            print "ERROR get_samples(): size of N list not equal to number of channels."
+        
+        # Get the packets from the buffer
+        packets, overruns, timeout_reached = self.buffer.get_packets(N, keep_all, timeout)
+        
+        # For each channel, get the x and y quadrature data
+        data = []
+        for n in range(len(packets)):
 
-    def _settings_sample_rate_changed(self, *a): 
-        self.timer_collect.stop()
-        
-        # Tell the Crimson then get the actual value
-        self._crimson.set_samp_rate(self.settings['Crimson/sample_rate'])
-        self.settings.set_value('Crimson/sample_rate', self._crimson.get_samp_rate(), True)
-        self.reset_acquisition()        
-        
-        self.docker.sleep(self.settings['Crimson/settle_time'])
-        self.timer_collect.start()
-        
-    def _settings_center_frequency_changed(self, *a):
-        self.timer_collect.stop()
-        
-        # Tell the Crimson then get the actual value
-        self._crimson.set_center_freq(self.settings['Crimson/center_frequency'])
-        self.settings.set_value('Crimson/center_frequency', self._crimson.get_center_freq(), True)
-        self.reset_acquisition()        
-        
-        self.docker.sleep(self.settings['Crimson/settle_time'])
-        self.timer_collect.start()
-            
-    def _settings_gain_changed(self, *a):
-        self.timer_collect.stop()
-        
-        # Tell the Crimson then get the actual value
-        self._crimson.set_gain(self.settings['Crimson/gain'])
-        self.settings.set_value('Crimson/gain', (126-self._crimson.get_gain())/4, True)
-        self.reset_acquisition()        
-        
-        self.docker.sleep(self.settings['Crimson/settle_time'])        
-        self.timer_collect.start()
-
-    def _settings_buffer_size_changed(self, *a):
-        self.buffer.set_size(self.settings['Software/buffer_size'])
-    
-    def start(self): return self._top_block.start():
-        
-    
-    def _timer_collect_tick(self, *a):
-        """
-        Called every time the data collection timer ticks.
-        """
-        # Update the number of packets
-        self.pb_buffer.setValue(_n.round(100.0*len(self.buffer)/self.buffer.get_size()))
-
-        # Update the user if the buffer overran
-        if self.buffer.get_overruns(): self.b_overrun.set_checked(True)
-                            
-        if self.b_collect.is_checked(): 
-
-            # Get the time spacing
-            dt = 1.0/self.settings['Crimson/sample_rate']
-
-            # Total time
-            T = self.settings['Software/sample_time']                        
-            N = int(_n.round(T/dt))
-            
-            # Get all the packets we need            
-            packets, overruns = self.get_packets(N, 1)
-            
-            # If we timed out
-            if len(packets) == 0: 
-                return
-
-            # Success! Increment the counter
-            self.n_trace_counter.increment()
-            
-            # Assemble the packets            
-            [x,y] = _n.concatenate(packets).transpose()
-
-            # If we're supposed to trigger, find the first index at which
-            # it crosses the threshold
-            l   = self.p_raw_trigger_level.value()
-            
-            ns0 = _n.where(x<l)[0]
-            if len(ns0) and self.b_trigger.is_checked():
+            if len(packets[n]):
+                # make it the right shape            
+                x,y = _n.concatenate(packets[n]).transpose()
                 
-                # first value below trigger
-                n0  = ns0[0]
-
-                # indices after n0 where we're above the trigger
-                ns1 = _n.where(x[n0:]>l)[0]+n0
-
-                # If we have a crossing                
-                if(len(ns1)):  t  = _n.arange(-ns1[0]*dt,(-ns1[0]+len(x)-0.5)*dt, dt) 
-                else:          t = _n.arange(0, (len(x)-0.5)*dt, dt)    
+                # If we're not keeping everything, throw away the old stuff
+                if not keep_all: 
+                    x = x[len(x)-N[n]:]
+                    y = y[len(y)-N[n]:]
+                
             else:
-                t = _n.arange(0, (len(x)-0.5)*dt, dt)
+                x = _n.array([], dtype=_n.int16)
+                y = _n.array([], dtype=_n.int16)
 
-            # Plot Raw
-            self.p_raw['t'] = t
-            self.p_raw['Nx'] = x
-            self.p_raw['Ny'] = y
-            self.settings.send_to_databox_header(self.p_raw)            
-            self.p_raw.plot()
-
-            # Plot Volts
-            self.p_volts['t'] = t
-            Vx = x*self.settings['Software/voltage_cal']*10**(-0.05*self.settings['Crimson/gain']) 
-            Vy = y*self.settings['Software/voltage_cal']*10**(-0.05*self.settings['Crimson/gain'])
-            self.p_volts['Vx'] = Vx
-            self.p_volts['Vy'] = Vy
-            self.settings.send_to_databox_header(self.p_volts)            
-            self.p_volts.plot()
-            
-            # PSD
-            if self.settings['Software/PSD_enabled']:
-                
-                # If we want the FFT to be extra efficient
-                if self.settings['Software/PSD_pow2']: N = 2**int(_n.log2(N))              
-                
-                # Loop over the data to get as many PSD's as possible from it                
-                for k in range(int(len(t)/int(N))):
-                    
-                    # Do the PSD
-                    result = _s.fun.fft(t[k*N:(k+1)*N], Vx[k*N:(k+1)*N]+1j*Vy[k*N:(k+1)*N], 
-                                          pow2=False, window=self.settings['Software/PSD_window'])
-                    
-                    # Happens if there is an invalid window
-                    if result == None: return                
-
-                    # Convert to PSD
-                    f, fft = result
-                    df = f[1]-f[0]
-                    f = f+self.settings['Crimson/center_frequency']                
-                    P = 0.5*abs(fft)**2 / df
-                    
-                    # Reset the counter if the length or the length has changed
-                    if len(self.p_psd) and not len(self.p_psd[0]) == len(f): self.reset_acquisition()
-    
-                    # Make sure we have the data arrays
-                    if len(self.p_psd) == 0: 
-                        self.p_psd['f'] = f
-                        self.p_psd['P'] = P
-    
-                    # Do the average
-                    n = self.n_psd_counter.get_value()
-                    self.p_psd['f'] = f
-                    self.p_psd['P'] = (self.p_psd['P']*n + P)/(n+1)
-                    self.settings.send_to_databox_header(self.p_psd)
-                    self.p_psd.plot()
-                
-                    # increment the psd counter
-                    if self.settings['Software/PSD_averages'] == 0 or n+1 <= self.settings['Software/PSD_averages']:
-                        self.n_psd_counter.increment()
-                    
-                    # Otherwise we're done!                    
-                    else:
-                        self.b_collect.set_checked(False)
-                    
-            self.docker.process_events()
-            
-            
-    def hide(self):  return self.docker.hide()
-    def show(self):  return self.docker.show()
-    
-    def reset_acquisition(self):
+            # Store it
+            data.append((x,y,overruns[n]))
         
-        # Resets counters, clears plots, clears buffers        
-        self.n_psd_counter.set_value(0)
-        self.n_trace_counter.set_value(0)
-        self.b_overrun.set_checked(False)
-        self.buffer.flush_buffer()
-        self.p_psd.clear()
-        self.p_raw.clear()
-        self.p_volts.clear()
+        # Return it
+        return data
 
+    def start(self):
+        """
+        Start the data flow.
+        """
+        self._top_block.start()
+    
 
 
 if __name__ == '__main__':   
-    c = jax_data_streamer() 
+    self = crimson()
+    self.enable_rx_channels([0,1])
+    self.start()
+    self.get_samples()
