@@ -138,10 +138,13 @@ class _data_buffer(_gr.sync_block):
             # Save some cpu cycles
             _time.sleep(0.001)
         
-        # Find required number of packets
+        # Count the packets
         packet_counts = []
         for n in range(len(packets)):
-            packet_counts.append(int(_n.ceil(1.0*samples[n]/len(packets[n][0]))))        
+            if len(packets[n]):
+                packet_counts.append(int(_n.ceil(1.0*samples[n]/len(packets[n][0]))))        
+            else:
+                packet_counts.append(0)
         
         # Now we can find the size of the packets, so wait for the specified 
         # number of samples.
@@ -240,10 +243,10 @@ class _data_buffer(_gr.sync_block):
 
 class crimson():
     """
-    Interface to the Crimson. Typical workflow:
+    Scripted interface to the Crimson (no GUI). Typical workflow:
     
-    c = crimson()
-    
+    c = crimson()   
+
     c.enable_rx_channels([0,1])
 
     c.start()
@@ -251,12 +254,11 @@ class crimson():
     c.get_packets()
     """
     
-    def __init__(self):
+    def __init__(self, rx_channels=[0,1], buffer_size=500):
         """
         Interface to the Crimson. Typical workflow:
         
         c = crimson()
-        c.enable_rx_channels([0,1])
         c.start()
         c.get_packets()
         """
@@ -264,17 +266,23 @@ class crimson():
         self.buffer               = None
         self._top_block           = None
         self._crimson             = None
+        self._simulation_mode     = False
+        self._connected_points    = []
+        
+        # Enable the specified channels and buffer
+        self._initialize_crimson(rx_channels, buffer_size)        
         
         return        
         
-    def enable_rx_channels(self, channels=[0,1], buffer_size=500):
+    def _initialize_crimson(self, channels=[0,2], buffer_size=500):
         """
         Enables the specified channels.
         
         Behind the scenes, this creates a top block and a GNU radio UHD 
         usrp_source object, then connects the usrp_source to a data buffer 
-        (stored in self.buffer).
+        (self.buffer).
         """
+        
         # Stop and clear any old processes
         if not self._top_block == None: 
             self._top_block.lock()            
@@ -289,13 +297,72 @@ class crimson():
         # Create the gnuradio top block
         self._top_block = _gr.top_block("Crimson")
 
-        # Create the crimson data faucet        
+        # Create the crimson data faucet  
         self._crimson = _uhd.usrp_source("crimson",
         	_uhd.stream_args(cpu_format="sc16", args='sc16', channels=(channels)))
-        
+
         # Connect the faucet to the buffer
-        for n in range(len(channels)):
-            self._top_block.connect((self._crimson, n), (self.buffer, n))
+        for n in range(len(channels)): self._connect(((self._crimson, n), (self.buffer, n)))
+
+    def get_sample_rate(self):
+        """
+        Gets the sampling rate (global).
+        """
+        return self._crimson.get_samp_rate()
+    
+    def get_center_frequency(self, channel=0):
+        """
+        Returns the current center frequency of the specified channel.
+        """
+        return self._crimson.get_center_freq(channel)
+    
+    def get_gain(self, channel=0):
+        """
+        Returns the current gain of the specified channel.
+        
+        NOTE: IS CURRENTLY INCORRECT FOR HIGH-BAND OPERATION.
+        """
+        return (126-self._crimson.get_gain())/4
+    
+    
+    
+
+    def _lock(self):   return self._top_block.lock()
+    def _unlock(self): return self._top_block.unlock()
+
+    def _connect(self, *point_pairs):
+        """
+        Takes any number of point pairs (a,b) and connects them in sequence.
+        """
+        for p in point_pairs:
+
+            # Store the connections for safe keeping
+            self._connected_points.append((p[0],p[1]))
+
+            # Connect them
+            self._top_block.connect(p[0],p[1])
+
+    def _disconnect(self, *point_pairs):
+        """
+        Takes any number of point pairs (a,b) and disconnects them. 
+        """
+        for p in point_pairs:
+            if not p in self._connected_points: 
+                print "ERROR _disconnect(): not in list of connected points."
+
+            # Find the index of this connection
+            i = self._connected_points.index(p)
+            
+            # Disconnect and forget
+            self._top_block.disconnect(*p)
+            self._connected_points.pop(i)
+    
+    def _disconnect_all(self):
+        """
+        Disconnects all crimson points from the buffer.
+        """
+        self._disconnect(*self._connected_points)
+       
 
     def get_enabled_rx_channels(self):
         """
@@ -303,12 +370,12 @@ class crimson():
         """
         return self._enabled_rx_channels
     
-    def get_samples(self, N=1024, keep_all=False, timeout=1.0):
+    def get_data(self, N=1024, keep_all=False, timeout=1.0):
         """
         Gets the most recent N samples from each channel, plus a list of 
         overrun counts for each. Resets the overrun counts. Return format:
         
-        [(X0,Y0,overruns0), (X1,Y1,overruns1), ...]
+        [(X0,Y0,overruns0), (X1,Y1,overruns1), ..., timeout_reached]
         
         N           Number of samples to get from each channel. Can be an 
                     integer or a list of integers (one for each channel).
@@ -350,8 +417,53 @@ class crimson():
             # Store it
             data.append((x,y,overruns[n]))
         
+        # Return the timeout info too.
+        data.append(timeout_reached)        
+        
         # Return it
         return data
+
+    def get_sample_rate(self):
+        """
+        Gets the sampling rate (global).
+        """
+        return self._crimson.get_samp_rate()
+    
+    def get_center_frequency(self, channel=0):
+        """
+        Returns the current center frequency of the specified channel.
+        """
+        return self._crimson.get_center_freq(channel)
+    
+    def get_gain(self, channel=0):
+        """
+        Returns the current gain of the specified channel.
+        
+        NOTE: IS CURRENTLY INCORRECT FOR HIGH-BAND OPERATION.
+        """
+        return (126-self._crimson.get_gain(channel))/4
+    
+
+    def set_sample_rate(self, sample_rate=1e5):
+        """
+        Gets the sampling rate (global).
+        """
+        return self._crimson.set_samp_rate(sample_rate)
+    
+    def set_center_frequency(self, center_frequency=7e7, channel=0):
+        """
+        Returns the current center frequency of the specified channel.
+        """
+        return self._crimson.set_center_freq(center_frequency, channel)
+    
+    def set_gain(self, gain=0, channel=0):
+        """
+        Returns the current gain of the specified channel.
+        
+        NOTE: IS CURRENTLY INCORRECT FOR HIGH-BAND OPERATION.
+        """
+        return self._crimson.set_gain(gain,channel)
+
 
     def start(self):
         """
@@ -359,10 +471,13 @@ class crimson():
         """
         self._top_block.start()
     
-
+    def stop(self):
+        """
+        Stop the data flow.
+        """
+        self._top_block.stop()
 
 if __name__ == '__main__':   
     self = crimson()
-    self.enable_rx_channels([0,1])
     self.start()
-    self.get_samples()
+    self.get_data()
