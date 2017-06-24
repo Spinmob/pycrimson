@@ -154,7 +154,7 @@ class _data_buffer(_gr.sync_block):
             
             # Return all data and clear the buffer
             packets[n] = packets[n] + self._buffer[n]
-            self._buffer[n] = []
+            self._buffer[n] = list([])
 
             self._buffer_lock.release()
 
@@ -210,6 +210,20 @@ class _data_buffer(_gr.sync_block):
         self._size_lock.release()
         return x
 
+    def get_packet_counts(self):
+        """
+        Returns the current number of packets in each channel of the buffer. 
+        len(self) will return the maximum of this list.
+        """
+        Ns = []
+        self._buffer_lock.acquire()
+        for ps in self._buffer: Ns.append(len(ps))
+        self._buffer_lock.release()
+        
+        return Ns
+
+    def __len__(self): return max(self.get_packet_counts()) 
+
     def work(self, input_items, output_items):
         
         # Acquire the buffer lock for the whole function.
@@ -247,14 +261,12 @@ class crimson():
     
     c = crimson()   
 
-    c.enable_rx_channels([0,1])
-
     c.start()
 
     c.get_packets()
     """
     
-    def __init__(self, rx_channels=[0,1], buffer_size=500):
+    def __init__(self, rx_channels=[0,1], buffer_size=500, simulation_mode=False):
         """
         Interface to the Crimson. Typical workflow:
         
@@ -262,15 +274,18 @@ class crimson():
         c.start()
         c.get_packets()
         """
-        self._enabled_rx_channels = None
+        if simulation_mode: print("WARNING: Simulation mode!")
+
+        self._enabled_rx_channels = rx_channels
         self.buffer               = None
         self._top_block           = None
         self._crimson             = None
-        self._simulation_mode     = False
+        self._simulation_mode     = simulation_mode
         self._connected_points    = []
         
         # Enable the specified channels and buffer
-        self._initialize_crimson(rx_channels, buffer_size)        
+        if not self._simulation_mode:
+            self._initialize_crimson(rx_channels, buffer_size)        
         
         return        
         
@@ -288,9 +303,6 @@ class crimson():
             self._top_block.lock()            
             self._top_block.stop()
         
-        # Store for safe keeping
-        self._enabled_rx_channels = channels        
-        
         # Create the buffer
         self.buffer = _data_buffer(500, len(channels))
         
@@ -303,30 +315,7 @@ class crimson():
 
         # Connect the faucet to the buffer
         for n in range(len(channels)): self._connect(((self._crimson, n), (self.buffer, n)))
-
-    def get_sample_rate(self):
-        """
-        Gets the sampling rate (global).
-        """
-        return self._crimson.get_samp_rate()
     
-    def get_center_frequency(self, channel=0):
-        """
-        Returns the current center frequency of the specified channel.
-        """
-        return self._crimson.get_center_freq(channel)
-    
-    def get_gain(self, channel=0):
-        """
-        Returns the current gain of the specified channel.
-        
-        NOTE: IS CURRENTLY INCORRECT FOR HIGH-BAND OPERATION.
-        """
-        return (126-self._crimson.get_gain())/4
-    
-    
-    
-
     def _lock(self):   return self._top_block.lock()
     def _unlock(self): return self._top_block.unlock()
 
@@ -387,6 +376,19 @@ class crimson():
                     
         timeout     Number of seconds to wait for the N samples.
         """
+        
+        if self._simulation_mode: 
+            
+            result = []
+            for n in range(len(self.get_enabled_rx_channels())):
+                t0 = _time.time()                
+                t  = _n.linspace(t0,t0+20,N)                
+                X  = 700*_n.cos(t+0.1*_n.random.normal(size=N))+100*_n.random.normal(size=N)
+                Y  = 700*_n.sin(t+0.1*_n.random.normal(size=N))+100*_n.random.normal(size=N)
+                result.append((X,Y,0))
+            result.append(False)
+            return result
+        
         # Make sure we have a sample number for each channel
         if not type(N) == list: N = [N]*len(self.get_enabled_rx_channels())
         
@@ -397,11 +399,13 @@ class crimson():
         # Get the packets from the buffer
         packets, overruns, timeout_reached = self.buffer.get_packets(N, keep_all, timeout)
         
-        # For each channel, get the x and y quadrature data
-        data = []
+        # Loop over each channel, get the x and y quadrature data
+        data = list([])
         for n in range(len(packets)):
 
+            # If we have any packets in this channel
             if len(packets[n]):
+                
                 # make it the right shape            
                 x,y = _n.concatenate(packets[n]).transpose()
                 
@@ -427,12 +431,14 @@ class crimson():
         """
         Gets the sampling rate (global).
         """
+        if self._simulation_mode: return 17.777e6
         return self._crimson.get_samp_rate()
     
     def get_center_frequency(self, channel=0):
         """
         Returns the current center frequency of the specified channel.
         """
+        if self._simulation_mode: return 17.777e6
         return self._crimson.get_center_freq(channel)
     
     def get_gain(self, channel=0):
@@ -441,19 +447,21 @@ class crimson():
         
         NOTE: IS CURRENTLY INCORRECT FOR HIGH-BAND OPERATION.
         """
+        if self._simulation_mode: return 7
         return (126-self._crimson.get_gain(channel))/4
     
-
     def set_sample_rate(self, sample_rate=1e5):
         """
         Gets the sampling rate (global).
         """
+        if self._simulation_mode: return
         return self._crimson.set_samp_rate(sample_rate)
     
     def set_center_frequency(self, center_frequency=7e7, channel=0):
         """
         Returns the current center frequency of the specified channel.
         """
+        if self._simulation_mode: return
         return self._crimson.set_center_freq(center_frequency, channel)
     
     def set_gain(self, gain=0, channel=0):
@@ -462,6 +470,7 @@ class crimson():
         
         NOTE: IS CURRENTLY INCORRECT FOR HIGH-BAND OPERATION.
         """
+        if self._simulation_mode: return
         return self._crimson.set_gain(gain,channel)
 
 
@@ -469,12 +478,14 @@ class crimson():
         """
         Start the data flow.
         """
+        if self._simulation_mode: return
         self._top_block.start()
     
     def stop(self):
         """
         Stop the data flow.
         """
+        if self._simulation_mode: return
         self._top_block.stop()
 
 if __name__ == '__main__':   

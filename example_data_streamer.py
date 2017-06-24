@@ -12,10 +12,13 @@ import pycrimson   as _pc
 
 class data_streamer():
     """
-    Simple GUI for streaming / analyzing / saving data from the Crimson.    
+    "Simple" GUI for streaming / analyzing / saving data from the Crimson.    
     """
 
-    def __init__(self, rx_channels=[0,1,2,3], buffer_size=500):
+    def __init__(self, rx_channels=[0,1,2,3], buffer_size=500, simulation_mode=False):
+        
+        # Note if we're in simulation mode.
+        self._simulation_mode = simulation_mode
         
         # Keep the list of available channels.
         self._rx_channels = rx_channels
@@ -25,13 +28,14 @@ class data_streamer():
         self._build_gui()
         
         # Create the pycrimson scripted interface (and connect!)
-        self.crimson = _pc.crimson(rx_channels, buffer_size)
+        self.crimson = _pc.crimson(rx_channels, buffer_size, simulation_mode)
         
         # Update settings from the Crimson itself
         self._get_settings_from_crimson()      
         
         # Set the buffer size to the previous value
-        self.crimson.buffer.set_size(self.settings['Software/Collect/buffer_size'])        
+        if not self._simulation_mode:
+            self.crimson.buffer.set_size(self.settings['Software/Acquisitions/buffer_size'])        
         
         # Show it!
         self.show()
@@ -51,11 +55,11 @@ class data_streamer():
         
         # Top controls
         self.g_top = self.docker.place_object(_egg.gui.GridLayout(False))
+        self.b_collect       = self.g_top.place_object(_egg.gui.Button("Go!", True, False))
         self.b_reset         = self.g_top.place_object(_egg.gui.Button("Reset"))
-        self.n_trace_counter = self.g_top.place_object(_egg.gui.NumberBox(0))
-        self.n_psd_counter   = self.g_top.place_object(_egg.gui.NumberBox(0))
         
         # button functions
+        self.b_collect.signal_clicked.connect(self._b_collect_clicked)
         self.b_reset.signal_clicked.connect(self._b_reset_clicked)
         
         # Data collection timer
@@ -87,29 +91,31 @@ class data_streamer():
         self.settings.add_parameter('Crimson/RXD/center_frequency', 7e6,  type='float', limits=(0,7e9),     decimals=12, suffix='Hz', siPrefix=True, step=0.1e6)
         self.settings.add_parameter('Crimson/RXD/gain',             0,    type='float', limits=(0,31.5), step=0.5,    suffix=' dB')
 
-        self.settings.add_parameter('Software/Collect',                False, type='bool')        
-        self.settings.add_parameter('Software/Collect/buffer_size',      1e3, type='int',   limits=(1,None), suffix=' packets', dec=True)
-        self.settings.add_parameter('Software/Collect/calibration',2.053e-05, type='float')
-        self.settings.add_parameter('Software/Collect/time',            0.01, type='float', limits=(1e-6,None), suffix='s', siPrefix=True, dec=True)
-        self.settings.add_parameter('Software/Collect/keep_extra',     False, type='bool')        
-        self.settings.add_parameter('Software/Collect/trigger_channel', None, type='list', values=[None]+self.get_channel_names())        
+        #self.b_collect = self.settings.add_button('Software/Acquisitions', True, False)
+        #self.settings.add_parameter('Software/Acquisitions',                False, type='bool')        
+        self.settings.add_parameter('Software/Acquisitions',                    0, type='int')
+        self.settings.add_parameter('Software/Acquisitions/count',              0, type='int')
+        self.settings.add_parameter('Software/Acquisitions/buffer_size',      1e3, type='int',   limits=(1,None), suffix=' packets', dec=True)
+        self.settings.add_parameter('Software/Acquisitions/calibration',2.053e-05, type='float')
+        self.settings.add_parameter('Software/Acquisitions/time',            0.01, type='float', limits=(1e-6,None), suffix='s', siPrefix=True, dec=True)
+        self.settings.add_parameter('Software/Acquisitions/keep_extra',     False, type='bool')        
+        self.settings.add_parameter('Software/Acquisitions/trigger_channel', None, type='list', values=['None']+self.get_channel_names())        
         
         self.settings.add_parameter('Software/PSD',            False, type='bool')        
-        self.settings.add_parameter('Software/PSD/averages',       0, type='float')
-        self.settings.add_parameter('Software/PSD/window',     "none",type='str')
+        self.settings.add_parameter('Software/PSD/count',   0,     type='int')
+        self.settings.add_parameter('Software/PSD/window',     "None",type='str')
         self.settings.add_parameter('Software/PSD/pow2',       True,  type='bool')
         
-
         # Load and set previous settings (if any)        
         self.settings.load()
+        self.settings['Software/PSD/count'] = 0
         
         # Set it up so that any changes are sent to the Crimson
         self.settings.connect_signal_changed('Crimson/sample_rate',      self._settings_sample_rate_changed)
         self.settings.connect_signal_changed('Crimson/RXA/center_frequency', self._settings_center_frequency_changed)
         self.settings.connect_signal_changed('Crimson/RXA/gain',             self._settings_gain_changed)
         
-        self.settings.connect_signal_changed('Software/Collect',                 self._settings_collect_changed)        
-        self.settings.connect_signal_changed('Software/Collect/buffer_size',     self._settings_buffer_size_changed)
+        self.settings.connect_signal_changed('Software/Acquisitions/buffer_size',     self._settings_buffer_size_changed)
         
         # for saving
         self.settings.connect_any_signal_changed(self._any_setting_changed)
@@ -143,20 +149,28 @@ class data_streamer():
         for n in range(4):
             if not n in self._rx_channels:
                 self.settings.block_events()
+                
+                # Get the name, e.g. "RXA"                
                 name = self.get_channel_names()[n]
+                
+                # Uncheck it.                
+                self.settings[name] = False
+                
+                # Hide the GUI for this channel.                
                 self.settings.hide_parameter(name)
+                
                 self.settings.unblock_events()
+            
 
     def _any_setting_changed(self, *a): 
         
         # Reset the PSD averages and save the settings
-        self.reset_acquisition()        
         self.settings.save()
 
-    def _settings_collect_changed(self, *a):
+    def _b_collect_clicked(self, *a):
         
         # If we're taking new data, reset the PSD, flush the buffer, reset the overrun        
-        if self.settings['Software/Collect']: self.reset_acquisition()
+        if self.b_collect.get_value(): self.reset_acquisition()
             
     def _b_reset_clicked(self, *a): 
         self.reset_acquisition()
@@ -166,7 +180,7 @@ class data_streamer():
         Asks the crimson what all the settings currently are, and updates
         the GUI. This also blocks all user-defined signals for changing the GUI.
         """
-        self.settings.set_value('Crimson/sample_rate',      self.crimson.get_sample_rate(),      True)
+        self.settings.set_value('Crimson/sample_rate',          self.crimson.get_sample_rate(),      True)
         self.settings.set_value('Crimson/RXA/center_frequency', self.crimson.get_center_frequency(), True)
         self.settings.set_value('Crimson/RXA/gain',             self.crimson.get_gain(),             True)
         
@@ -186,8 +200,8 @@ class data_streamer():
         self.timer_collect.stop()
         
         # Tell the Crimson then get the actual value
-        self.crimson.set_center_freq(self.settings['Crimson/RXA/center_frequency'])
-        self.settings.set_value('Crimson/RXA/center_frequency', self.crimson.get_center_freq(), True)
+        self.crimson.set_center_frequency(self.settings['Crimson/RXA/center_frequency'])
+        self.settings.set_value('Crimson/RXA/center_frequency', self.crimson.get_center_frequency(), True)
         self.reset_acquisition()        
         
         self.docker.sleep(self.settings['Crimson/settle_time'])
@@ -205,7 +219,7 @@ class data_streamer():
         self.timer_collect.start()
 
     def _settings_buffer_size_changed(self, *a):
-        self.crimson.buffer.set_size(self.settings['Software/Collect/buffer_size'])
+        self.crimson.buffer.set_size(self.settings['Software/Acquisitions/buffer_size'])
     
     def start(self): return self._top_block.start()
     
@@ -215,151 +229,205 @@ class data_streamer():
         """
         return ['Crimson/RXA','Crimson/RXB','Crimson/RXC','Crimson/RXD']
     
-    def get_enabled_channels(self):
+    def get_gui_enabled_channels(self):
         """
-        Returns the indices of the enabled channels.
+        Returns the indices of the enabled channels (as per the check boxes).
+
+        See self.get_crimson_enabled_channels() for the list of channels that are
+        always streaming.
         """
         names = self.get_channel_names()
         a = []
         for n in range(4):
             if self.settings[names[n]]: a.append(n)
         return a    
+
+    def get_crimson_enabled_channels(self):
+        """
+        Returns the list of channels that can be enabled, as per the 
+        initialization of this object.
+        """
+        return list(self._rx_channels)
+
+
+    def get_and_plot_data(self):
+        """
+        Empties the buffer, plots and calibrates the data according to the 
+        settings panel. Stores and plots the raw and calibrated data in
+           
+           self.p_raw
+           self.p_volts
+
+        respectively. If PSD is enabled, performs the PSD and plots it in
+        
+           self.p_psd.
+           
+        If you don't want this to plot, you can disable the plots in the gui.
+        """
+        
+        # Get the time step
+        dt = 1.0/self.settings['Crimson/sample_rate']
+
+        # Total time and number of samples
+        T = self.settings['Software/Acquisitions/time']                        
+        N = int(_n.round(T/dt))
+        
+        # Get all the packets we need          
+        samples = self.crimson.get_data(N, keep_all=self.settings['Software/Acquisitions/keep_extra'])
+        
+        # If we timed out, the last element is False.
+        if samples[-1]: return
+
+        # Remove old data
+        self.p_raw.clear()
+        self.p_volts.clear()
+        
+        # Default for the time column
+        t = _n.arange(0, (len(samples[0][0])-0.5)*dt, dt)
+        self.p_raw['t']   = t
+        self.p_volts['t'] = t
+        
+        # Store the enabled channels
+        enabled   = self.get_gui_enabled_channels()
+        available = self.get_crimson_enabled_channels()         
+        for n in enabled: 
+            
+            # Get the column labels
+            nameX = self.get_channel_names()[n]+"/X"            
+            nameY = self.get_channel_names()[n]+"/Y"            
+            
+            # Store the raw data by name             
+            self.p_raw[nameX] = samples[available.index(n)][0]
+            self.p_raw[nameY] = samples[available.index(n)][1]
+            
+            # Calibrate to volts
+            Vx = self.p_volts[nameX] = self.p_raw[nameX]*self.settings['Software/Acquisitions/calibration']*10**(-0.05*self.settings['Crimson/RXA/gain']) 
+            Vy = self.p_volts[nameY] = self.p_raw[nameY]*self.settings['Software/Acquisitions/calibration']*10**(-0.05*self.settings['Crimson/RXA/gain'])  
+            
+            # Check for overruns
+            if samples[available.index(n)][2]: self.b_overrun.set_checked()   
+        
+            # PSD
+            if self.settings['Software/PSD']:
+                
+                # If we want the FFT to be extra efficient, set the number of
+                # points to a power of 2.
+                if self.settings['Software/PSD/pow2']: N = 2**int(_n.log2(N))              
+                
+                # Loop over the data to get as many PSD averages as possible from it                
+                for k in range(int(len(t)/int(N))):
+                    
+                    # Do the PSD
+                    result = _s.fun.fft(t[0:N], Vx[k*N:(k+1)*N]+1j*Vy[k*N:(k+1)*N], 
+                                        pow2=False, window=self.settings['Software/PSD/window'])
+                    
+                    # None comes back if there is an invalid window, for example
+                    if not result == None:                 
+        
+                        # Convert to PSD
+                        f, fft = result
+                        df = f[1]-f[0]
+                        f = f+self.settings['Crimson/RXA/center_frequency']                
+                        P = 0.5*abs(fft)**2 / df
+                        
+                        # Reset the counter if the there exists data that has
+                        # the wrong format. This should never happen as the
+                        # Acquisition is reset every time a setting changes.
+                        if len(self.p_psd) and (not len(self.p_psd[0]) == len(f) or not (self.p_psd[0][0]==f[0] and self.p_psd[0][-1]==f[-1])): 
+                            print("WARNING: I noticed a change in the frequency domain. This shouldn't happen at this point in the code. Acquisition should be reset elsewhere.")                            
+                            self.p_psd.clear()
+                            self.settings['Software/PSD/count'] = 0                            
+                            
+                        # Get the name of the column
+                        nameP = self.get_channel_names()[n]+"/P"          
+        
+                        # Make sure we have the data arrays (e.g. after a reset)
+                        if not nameP in self.p_psd.ckeys: 
+                            self.p_psd['f']   = f
+                            self.p_psd[nameP] = P
+        
+                        # Do the average
+                        n_psd = self.settings['Software/PSD/count']
+                        self.p_psd[nameP] = (self.p_psd[nameP]*n_psd + P)/(n_psd+1)
+
+                        # increment the psd counter
+                        self.settings['Software/PSD/count'] += 1
+        
+        # If we're not supposed to trigger, use time from 0 to max            
+        name = self.settings['Software/Acquisitions/trigger_channel']
+            
+        # Otherwise, find the first index at which
+        # it crosses the threshold
+        if not name == 'None':
+            
+            # Choose the raw channel, and use the x quadrature for now
+            x = self.p_raw[name+"/X"]                
+            
+            # Trigger level
+            l = self.p_raw_trigger_level.value()
+
+            # All values where we're below the trigger level
+            ns0 = _n.where(x<l)[0]            
+            
+            # If we have any values below the trigger and we're supposed to 
+            # trigger, find the crossing
+            if len(ns0) and self.b_trigger.is_checked():
+                
+                # first value below trigger
+                n0  = ns0[0]
+
+                # indices after n0 where we're above the trigger
+                ns1 = _n.where(x[n0:]>l)[0]+n0
+
+                # If we have a crossing, subract the time offset
+                if(len(ns1)):  
+                    self.p_raw['t']   = self.p_raw['t']   - ns1[0]*dt 
+                    self.p_volts['t'] = self.p_volts['t'] - ns1[0]*dt
+
+        # Plot Raw
+        self.settings.send_to_databox_header(self.p_raw)            
+        self.p_raw.plot()
+
+        # Plot Volts
+        self.settings.send_to_databox_header(self.p_volts)            
+        self.p_volts.plot()
+
+        # Plot PSD
+        self.settings.send_to_databox_header(self.p_psd)
+        self.p_psd.plot()
+
+        # Find out if we're done
+        self.settings['Software/Acquisitions/count'] += 1
+        if self.settings['Software/Acquisitions'] > 0 and \
+           self.settings['Software/Acquisitions/count'] >= self.settings['Software/Acquisitions']:
+               self.b_collect.set_checked(False)
+        
+        # Update the gui if it's not already
+        self.docker.process_events()
+
     
     def _timer_collect_tick(self, *a):
         """
         Called every time the data collection timer ticks.
         """
         # Update the number of packets
-        #self.pb_buffer.setValue(int(_n.round(100.0*len(self.crimson.buffer)/self.crimson.buffer.get_size())))
-
-        # Update the user if the buffer overran
-        if self.crimson.buffer.get_overruns(): self.b_overrun.set_checked(True)
-                            
-        if self.settings['Software/Collect']: 
-
-            # Get the time step
-            dt = 1.0/self.settings['Crimson/sample_rate']
-
-            # Total time and number of samples
-            T = self.settings['Software/Collect/time']                        
-            N = int(_n.round(T/dt))
-            
-            # Get all the packets we need            
-            samples = self.crimson.get_data(N, keep_all=self.settings['Software/Collect/keep_extra'])
-            
-            # If we timed out, the last element is False.
-            if samples[-1]: return
-
-            # Success! Increment the counter
-            self.n_trace_counter.increment()
-            
-            # Store the data
-            
-            # Remove old data and put a placeholder in for time
-            self.p_raw.clear()
-            self.p_raw['t'] = []
-            
-            # Store the enabled channels
-            for n in self.get_enabled_channels():
+        if not self._simulation_mode:
+            self.pb_buffer.setValue(int(_n.round(100.0*len(self.crimson.buffer)/self.crimson.buffer.get_size()[0])))
+        
+            # Update the user if the buffer overran
+            if sum(self.crimson.buffer.get_overruns()): self.b_overrun.set_checked(True)
+               
+        # We need to enable at least one channel and have "Collect" checked
+        # to collect / plot any data
+        enabled = False
+        for n in self.get_gui_enabled_channels(): 
+            if self.settings[self.get_channel_names()[n]]: enabled = True
                 
-                # By name                
-                self.p_raw[self.get_channel_names()[n]+"/X"] = samples[n][0]
-                self.p_raw[self.get_channel_names()[n]+"/Y"] = samples[n][1]
-                
-                # Check for overruns
-                if samples[n][2]: self.b_overrun.set_checked()   
-            
-            # If we're not supposed to trigger, use time from 0 to max            
-            name = self.settings['Software/Collect/trigger_channel']
-            if name == None:
-                self.p_raw['t'] = _n.arange(0, (len(samples[0][0])-0.5)*dt, dt)
-            
-            # Otherwise, find the first index at which
-            # it crosses the threshold
-            else:
-                # Choose the channel, and use the x quadrature for now
-                x = self.p_raw[name+"/X"]                
-                
-                # Trigger level
-                l = self.p_raw_trigger_level.value()
+        if self.b_collect.is_checked() and enabled: self.get_and_plot_data()
 
-                # All values where we're below the trigger level
-                ns0 = _n.where(x<l)[0]            
-                
-                # If we have any values below the trigger and we're supposed to 
-                # trigger, find the crossing
-                if len(ns0) and self.b_trigger.is_checked():
+
+
                     
-                    # first value below trigger
-                    n0  = ns0[0]
-    
-                    # indices after n0 where we're above the trigger
-                    ns1 = _n.where(x[n0:]>l)[0]+n0
-    
-                    # If we have a crossing                
-                    if(len(ns1)):  self.p_raw['t'] = _n.arange(-ns1[0]*dt,(-ns1[0]+len(x)-0.5)*dt, dt) 
-                    else:          self.p_raw['t'] = _n.arange(0, (len(samples[0][0])-0.5)*dt, dt)   
-                
-
-            # Plot Raw
-            self.settings.send_to_databox_header(self.p_raw)            
-            self.p_raw.plot()
-
-#            # Plot Volts
-#            self.p_volts['t'] = t
-#            Vx = x*self.settings['Software/Collect/calibration']*10**(-0.05*self.settings['Crimson/RXA/gain']) 
-#            Vy = y*self.settings['Software/Collect/calibration']*10**(-0.05*self.settings['Crimson/RXA/gain'])
-#            self.p_volts['Vx'] = Vx
-#            self.p_volts['Vy'] = Vy
-#            self.settings.send_to_databox_header(self.p_volts)            
-#            self.p_volts.plot()
-#            
-#            # PSD
-#            if self.settings['Software/PSD']:
-#                
-#                # If we want the FFT to be extra efficient
-#                if self.settings['Software/PSD/pow2']: N = 2**int(_n.log2(N))              
-#                
-#                # Loop over the data to get as many PSD's as possible from it                
-#                for k in range(int(len(t)/int(N))):
-#                    
-#                    # Do the PSD
-#                    result = _s.fun.fft(t[k*N:(k+1)*N], Vx[k*N:(k+1)*N]+1j*Vy[k*N:(k+1)*N], 
-#                                          pow2=False, window=self.settings['Software/PSD/window'])
-#                    
-#                    # Happens if there is an invalid window
-#                    if result == None: return                
-#
-#                    # Convert to PSD
-#                    f, fft = result
-#                    df = f[1]-f[0]
-#                    f = f+self.settings['Crimson/RXA/center_frequency']                
-#                    P = 0.5*abs(fft)**2 / df
-#                    
-#                    # Reset the counter if the length or the length has changed
-#                    if len(self.p_psd) and not len(self.p_psd[0]) == len(f): self.reset_acquisition()
-#    
-#                    # Make sure we have the data arrays
-#                    if len(self.p_psd) == 0: 
-#                        self.p_psd['f'] = f
-#                        self.p_psd['P'] = P
-#    
-#                    # Do the average
-#                    n = self.n_psd_counter.get_value()
-#                    self.p_psd['f'] = f
-#                    self.p_psd['P'] = (self.p_psd['P']*n + P)/(n+1)
-#                    self.settings.send_to_databox_header(self.p_psd)
-#                    self.p_psd.plot()
-#                
-#                    # increment the psd counter
-#                    if self.settings['Software/PSD/averages'] == 0 or n+1 <= self.settings['Software/PSD/averages']:
-#                        self.n_psd_counter.increment()
-#                    
-#                    # Otherwise we're done!                    
-#                    else:
-#                        self.b_collect.set_checked(False)
-                    
-            self.docker.process_events()
             
             
     def hide(self):  return self.docker.hide()
@@ -368,10 +436,10 @@ class data_streamer():
     def reset_acquisition(self):
         
         # Resets counters, clears plots, clears buffers        
-        self.n_psd_counter.set_value(0)
-        self.n_trace_counter.set_value(0)
+        self.settings['Software/PSD/count'] = 0
+        self.settings['Software/Acquisitions/count'] = 0
         self.b_overrun.set_checked(False)
-        self.crimson.buffer.flush_buffer()
+        if not self._simulation_mode: self.crimson.buffer.flush_buffer()
         self.p_psd.clear()
         self.p_raw.clear()
         self.p_volts.clear()
@@ -379,5 +447,5 @@ class data_streamer():
 
 
 if __name__ == '__main__':   
-    self = data_streamer([0,3])
+    self = data_streamer([0], simulation_mode=True)
     
