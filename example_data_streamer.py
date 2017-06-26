@@ -10,6 +10,7 @@ import spinmob.egg as _egg
 import pycrimson   as _pc
 
 
+
 class data_streamer():
     """
     "Simple" GUI for streaming / analyzing / saving data from the Crimson.    
@@ -63,9 +64,8 @@ class data_streamer():
         self.b_reset.signal_clicked.connect(self._b_reset_clicked)
         
         # Data collection timer
-        self.timer_collect = _egg.pyqtgraph.QtCore.QTimer()
-        self.timer_collect.setInterval(1)
-        self.timer_collect.timeout.connect(self._timer_collect_tick)
+        self.timer_collect = _egg.gui.Timer(1)
+        self.timer_collect.signal_tick.connect(self._timer_collect_tick)
         
         # Create Settings tree and parameters
         self.docker.new_autorow()
@@ -447,5 +447,7 @@ class data_streamer():
 
 
 if __name__ == '__main__':   
-    self = data_streamer([0], simulation_mode=True)
+    #self = data_streamer([0])
+
+
     

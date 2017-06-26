@@ -5,6 +5,8 @@ import thread      as _thread
 import time        as _time
 import numpy       as _n
 
+
+
 class _data_buffer(_gr.sync_block):
     """
     A simple GNU Radio data buffer.
@@ -14,24 +16,33 @@ class _data_buffer(_gr.sync_block):
         """
         Thread-safe data buffer that will hold the number of data packets
         specified by "size" in the specified number of channels (size can be
-        an integer or list of sizes, one for each channel).
+        an integer or list of sizes, one for each channel). "payload" is the
+        number of bytes per packet, which for the crimson means
+        
+           (payload-16)/4/channels samples per packet
         """
         
         # Initialize the base object
         _gr.sync_block.__init__(self, name="_data_buffer", 
                 in_sig=[(_n.int16,2)]*channels, out_sig=None)
+            
+        # Some internal variables to keep track of
+        self._channel_count = channels
+         
+        # Thread locks for the elements read / written on the fly
+        self._buffer_lock          = _thread.allocate_lock()
+        self._buffer_overruns_lock = _thread.allocate_lock()
+        self._size_lock            = _thread.allocate_lock()                
         
-        # Create the buffer
-        self._buffer  = [[]]*channels
-        self._buffer_lock = _thread.allocate_lock()
-
+        # Creates self._buffer and self._buffer_overruns to track
+        # the actual data and count overruns, respectively
+        self._buffer          = []
+        self._buffer_overruns = []
+        self.flush()
+        
         # Save this for size checking
-        self._size_lock = _thread.allocate_lock()                
         self.set_size(size)        
         
-        # Flag for whether the buffer has overrun since the last reset 
-        self._buffer_overruns = [0]*self.get_channels()
-        self._buffer_overruns_lock = _thread.allocate_lock()
         
     
     def __len__(self):
@@ -40,7 +51,7 @@ class _data_buffer(_gr.sync_block):
         """
         Ns = []
         self._buffer_lock.acquire()
-        for n in range(self.get_channels()): Ns.append(len(self._buffer[n]))
+        for n in range(self.get_channel_count()): Ns.append(len(self._buffer[n]))
         self._buffer_lock.release()
         return Ns
     
@@ -51,30 +62,57 @@ class _data_buffer(_gr.sync_block):
         (one for each channel).
         """
         # Make sure we have a number for each channel
-        if not type(n)==list: n = [n]*self.get_channels()        
+        if not type(n)==list: n = [n]*self.get_channel_count()        
 
         # Check each channel        
         for i in range(len(packets)): 
             if len(packets[i]) < n[i]: return False
         return True
     
-    def flush_buffer(self):
+    def _at_least_n_samples(self, data, n=1):
         """
-        Clears the buffer.
+        Returns True only if all the data=[[x1,y1],[x2,y2],...] have the 
+        required number of samples. n can be a list or integer.
         """
-        self._buffer_lock.acquire()
-        self._buffer = [[]]*self.get_channels()
-        self._buffer_lock.release()
-        
-        self._buffer_overruns_lock.acquire()
-        self._buffer_overruns = [0]*self.get_channels()
-        self._buffer_overruns_lock.release()        
+        # Make sure we have a number for each channel
+        if not type(n)==list: n = [n]*self.get_channel_count()        
 
-    def get_channels(self): 
+        # Check each channel
+        for i in range(len(data)):
+            if len(data[i][0]) < n[i] or len(data[i][1]) < n[i]: return False
+        return True
+    
+    def flush(self, reset_overruns=True):
+        """
+        Clears the buffer. Returns it and the overruns count.
+        """
+        # We can't do [[]]*N because it doesn't create separate instances!
+        self._buffer_lock.acquire()
+        self._buffer_overruns_lock.acquire()
+
+        # Keep these safe, making a copy of overruns because we don't
+        # necessarily unlink it from the internal object
+        b = self._buffer
+        o = list(self._buffer_overruns)
+
+        # Reset the buffer
+        self._buffer = list()
+        for n in range(self.get_channel_count()): self._buffer.append(list())
+        
+        # Reset the overruns if we're supposed to
+        if reset_overruns: self._buffer_overruns = [0]*self.get_channel_count()
+
+        self._buffer_lock.release()
+        self._buffer_overruns_lock.release()        
+            
+        # Send the data back
+        return b, o
+
+    def get_channel_count(self): 
         """
         Returns the number of channels.
         """
-        return len(self._buffer)
+        return self._channel_count
 
     def get_overruns(self, reset=False):
         """
@@ -84,14 +122,14 @@ class _data_buffer(_gr.sync_block):
         self._buffer_overruns_lock.acquire()
         
         # Make a copy to avoid referencing issues
-        x = list(self._buffer_overruns)
-        if reset: self._buffer_overruns = [0]*self.get_channels()
+        x = self._buffer_overruns
+        if reset: self._buffer_overruns = [0]*self.get_channel_count()
         
         self._buffer_overruns_lock.release()     
         
         return x
     
-    def get_packets(self, samples=1, keep_all=False, timeout=1.0):
+    def get_data(self, samples=1024, keep_all=False, timeout=1.0):
         """
         Waits for enough packets to have at least the specified number of 
         samples (or the timeout), then returns all packets, the number of 
@@ -108,75 +146,70 @@ class _data_buffer(_gr.sync_block):
                       (this is ideal for taking long continuous data).
         
         timeout       Specifies the "give up" time
+        
+        Returns [[x1,y1],[x2,y2],...], overrun_counts, timeout_reached
+        
+        where x1, y1, x2, etc are numpy arrays for the two quadratures of each
+        channel.
         """
+        # Make sure samples is a numpy array
+        if not type(samples) == list: samples = [samples]*self.get_channel_count()
+        samples = _n.array(samples)
 
-        # Make sure there is a number for each channel.
-        if not type(samples) == list: samples = [samples]*self.get_channels()
-
-        # Idiot proofing
-        if not len(samples) == self.get_channels():
-            print "ERROR get_packets(): length of samples is not equal to the number of channels."
-        
+        # Get the starting time for measuring timeout
         t0 = _time.time()
-        packets = [[]]*self.get_channels()
-
+        
         # Timeout flag
-        timeout_reached = False        
+        timeout_reached = False
+
+        # create the thing to hold the data
+        d = []
+        for n in range(self.get_channel_count()): d.append([[],[]])
+        sample_counts = _n.zeros(self.get_channel_count())
         
-        # Wait until we get (at least) our first packet
-        while _time.time()-t0 < timeout and not self._at_least_n_packets(packets,1): 
+        # Wait until we get (at least) the right number of samples in each channel
+        while _time.time()-t0 < timeout and (sample_counts<samples).any(): 
             
-            self._buffer_lock.acquire()
-            
-            # Append all data from each channel and clear the buffer
-            for n in range(self.get_channels()): 
-                packets[n] = packets[n] + self._buffer[n]
-                self._buffer[n] = []
-
-            self._buffer_lock.release()
-
-            # Save some cpu cycles
-            _time.sleep(0.001)
+            # Get and clear the buffer
+            ps, o = self.flush(reset_overruns=False)
         
-        # Count the packets
-        packet_counts = []
-        for n in range(len(packets)):
-            if len(packets[n]):
-                packet_counts.append(int(_n.ceil(1.0*samples[n]/len(packets[n][0]))))        
-            else:
-                packet_counts.append(0)
-        
-        # Now we can find the size of the packets, so wait for the specified 
-        # number of samples.
-        while _time.time()-t0 < timeout and not self._at_least_n_packets(packets, packet_counts): 
-            
-            self._buffer_lock.acquire()
-            
-            # Return all data and clear the buffer
-            packets[n] = packets[n] + self._buffer[n]
-            self._buffer[n] = list([])
-
-            self._buffer_lock.release()
-
-            # Save some cpu cycles
-            _time.sleep(0.001)
-
-        # Get the number of overruns and reset
-        overruns = self.get_overruns(True)
-
-        # Throw away extras if we're supposed to
-        if not keep_all: 
-            for n in range(len(packets)):            
+            # Convert packets (p) into data [[x1,y1],[x2,y2],...]        
+            for n in range(self.get_channel_count()):
                 
+                # If we have packets on this channel
+                if len(ps[n]):
+                    
+                    # Loop over the packets for this channel, store the data
+                    # and increment the sample count
+                    for p in ps[n]:
+                        d[n][0].append(p[:,0])
+                        d[n][1].append(p[:,1])
+                        sample_counts[n] += len(d[n][0])
+        
+            # Save some cpu cycles
+            _time.sleep(0.001)
+        
+        # At this point we've got at least enough or have timed out.
+
+        # Tidy up the data
+        for n in range(self.get_channel_count()):
+            
+            # Concatenate the data lists (we only want to do this once)
+            d[n][0] = _n.concatenate(d[n][0])
+            d[n][1] = _n.concatenate(d[n][1])
+            
+            # Throw away extras if we're supposed to
+            if not keep_all: 
                 # Keep the most recent                
-                packets[n] = packets[n][len(packets[n])-packet_counts[n]:]
+                d[n][0] = d[n][0][len(d[n][0])-samples[n]:]
+                d[n][1] = d[n][1][len(d[n][1])-samples[n]:]
 
         # If we reached the timeout
         if _time.time()-t0 >= timeout: 
-            print "WARNING: get_packets() timeout"
+            print("WARNING: get_data() timeout")
             timeout_reached = True
 
-        return packets, overruns, timeout_reached
+        return d, self.get_overruns(reset=True), timeout_reached
 
     def reset_overruns(self):
         """
@@ -190,10 +223,10 @@ class _data_buffer(_gr.sync_block):
         one for each channel.
         """
         # Make sure we have a size for each channel
-        if not type(size)==list: size = [size]*self.get_channels()
+        if not type(size)==list: size = [size]*self.get_channel_count()
 
         # Idiot proofing
-        if not len(size) == self.get_channels():
+        if not len(size) == self.get_channel_count():
             print "ERROR set_size(): size list length doesn't match number of channels."
             return
         
@@ -287,6 +320,9 @@ class crimson():
         if not self._simulation_mode:
             self._initialize_crimson(rx_channels, buffer_size)        
         
+        # Aliases
+        self.get_data = self.buffer.get_data        
+    
         return        
         
     def _initialize_crimson(self, channels=[0,2], buffer_size=500):
@@ -298,13 +334,8 @@ class crimson():
         (self.buffer).
         """
         
-        # Stop and clear any old processes
-        if not self._top_block == None: 
-            self._top_block.lock()            
-            self._top_block.stop()
-        
         # Create the buffer
-        self.buffer = _data_buffer(500, len(channels))
+        self.buffer = _data_buffer(buffer_size, len(channels))
         
         # Create the gnuradio top block
         self._top_block = _gr.top_block("Crimson")
@@ -359,74 +390,6 @@ class crimson():
         """
         return self._enabled_rx_channels
     
-    def get_data(self, N=1024, keep_all=False, timeout=1.0):
-        """
-        Gets the most recent N samples from each channel, plus a list of 
-        overrun counts for each. Resets the overrun counts. Return format:
-        
-        [(X0,Y0,overruns0), (X1,Y1,overruns1), ..., timeout_reached]
-        
-        N           Number of samples to get from each channel. Can be an 
-                    integer or a list of integers (one for each channel).
-        
-        keep_all    If True, this will return all the data from the buffer,
-                    not just the most recent N samples. Use this option if you
-                    need to take long continuous blocks of data or want to 
-                    maximize your duty cycle.
-                    
-        timeout     Number of seconds to wait for the N samples.
-        """
-        
-        if self._simulation_mode: 
-            
-            result = []
-            for n in range(len(self.get_enabled_rx_channels())):
-                t0 = _time.time()                
-                t  = _n.linspace(t0,t0+20,N)                
-                X  = 700*_n.cos(t+0.1*_n.random.normal(size=N))+100*_n.random.normal(size=N)
-                Y  = 700*_n.sin(t+0.1*_n.random.normal(size=N))+100*_n.random.normal(size=N)
-                result.append((X,Y,0))
-            result.append(False)
-            return result
-        
-        # Make sure we have a sample number for each channel
-        if not type(N) == list: N = [N]*len(self.get_enabled_rx_channels())
-        
-        # Idiot proof
-        if not len(N) == len(self.get_enabled_rx_channels()):
-            print "ERROR get_samples(): size of N list not equal to number of channels."
-        
-        # Get the packets from the buffer
-        packets, overruns, timeout_reached = self.buffer.get_packets(N, keep_all, timeout)
-        
-        # Loop over each channel, get the x and y quadrature data
-        data = list([])
-        for n in range(len(packets)):
-
-            # If we have any packets in this channel
-            if len(packets[n]):
-                
-                # make it the right shape            
-                x,y = _n.concatenate(packets[n]).transpose()
-                
-                # If we're not keeping everything, throw away the old stuff
-                if not keep_all: 
-                    x = x[len(x)-N[n]:]
-                    y = y[len(y)-N[n]:]
-                
-            else:
-                x = _n.array([], dtype=_n.int16)
-                y = _n.array([], dtype=_n.int16)
-
-            # Store it
-            data.append((x,y,overruns[n]))
-        
-        # Return the timeout info too.
-        data.append(timeout_reached)        
-        
-        # Return it
-        return data
-
     def get_sample_rate(self):
         """
         Gets the sampling rate (global).
@@ -454,14 +417,14 @@ class crimson():
         """
         Gets the sampling rate (global).
         """
-        if self._simulation_mode: return
+        if self._simulation_mode: return 17.777e6
         return self._crimson.set_samp_rate(sample_rate)
     
     def set_center_frequency(self, center_frequency=7e7, channel=0):
         """
         Returns the current center frequency of the specified channel.
         """
-        if self._simulation_mode: return
+        if self._simulation_mode: return 17.777e6
         return self._crimson.set_center_freq(center_frequency, channel)
     
     def set_gain(self, gain=0, channel=0):
@@ -470,7 +433,7 @@ class crimson():
         
         NOTE: IS CURRENTLY INCORRECT FOR HIGH-BAND OPERATION.
         """
-        if self._simulation_mode: return
+        if self._simulation_mode: return 7
         return self._crimson.set_gain(gain,channel)
 
 
@@ -478,17 +441,60 @@ class crimson():
         """
         Start the data flow.
         """
-        if self._simulation_mode: return
+        if self._simulation_mode: return self
         self._top_block.start()
+        return self
     
     def stop(self):
         """
         Stop the data flow.
         """
-        if self._simulation_mode: return
+        if self._simulation_mode: return self
         self._top_block.stop()
+        return self
 
 if __name__ == '__main__':   
     self = crimson()
     self.start()
-    self.get_data()
+    d, o, z = self.get_data()
+
+
+## Code that cleans up the front-panel RX LEDs
+#
+#    c = _uhd.usrp_source("crimson",
+#        	_uhd.stream_args(cpu_format="sc16", args='sc16', channels=([0,1,2,3]))) 
+#    c.start()
+#    c.stop()
+
+## Really basic egg GUI to stream data.
+#   
+#    import spinmob.egg as _egg
+#    import pycrimson   as _pc
+#    
+#    channels = [0]
+#    single_shot = False
+#
+#    # Basic GUI
+#    w = _egg.gui.Window(autosettings_path="w")
+#    t = _egg.gui.Timer(500, single_shot=single_shot)
+#    p = w.place_object(_egg.gui.DataboxPlot())  
+#    w.load_gui_settings()
+#    
+#    # Crimson
+#    c = _pc.crimson(channels,5)
+#    for n in channels: c.set_center_frequency(7e6, n)
+#    c.start()
+#        
+#    # Timer tick function
+#    def tick(*a):
+#        [[x,y]],o,z = c.get_data(10000)
+#        
+#        p['t'] = range(len(x))
+#        p['x'] = x
+#        p['y'] = y
+#        p.plot()
+#        w.process_events()
+#    
+#    t.signal_tick.connect(tick)
+#    w.show(); t.start()
+    
