@@ -1,4 +1,4 @@
-
+#!/usr/bin/env python
 
 from gnuradio import gr  as _gr
 from gnuradio import uhd as _uhd
@@ -15,10 +15,23 @@ import pycrimson   as _pc
 
 class data_streamer():
     """
-    "Simple" GUI for streaming / analyzing / saving data from the Crimson.    
+    GUI for streaming / analyzing / saving data from the Crimson. Requires
+    spinmob and pyqtgraph python libraries.
+
+    Parameters
+    ----------
+    rx_channels
+        list of physically enabled channels
+    buffer_size
+        how many packets the buffer should hold (default 346 samples/packet)
+    simulation_mode
+        whether to run this without connecting to the crimson (janky right now)
+    block_command_line
+        whether to block the terminal; set to False if running within a python
+        console if you'd like to interact with it.
     """
 
-    def __init__(self, rx_channels=[0,2,3], buffer_size=500, simulation_mode=False):
+    def __init__(self, rx_channels=[0,2,3], buffer_size=500, simulation_mode=False, block_command_line=False):
         
         # Note if we're in simulation mode.
         self._simulation_mode = simulation_mode
@@ -40,14 +53,15 @@ class data_streamer():
         if not self._simulation_mode:
             self.crimson.buffer.set_size(self.settings['Software/Acquisitions/buffer_size'])        
         
-        # Show it!
-        self.show()
-        
         # Start the crimson.
         self.crimson.start()
         
         # Start the collection timer
         self.timer_collect.start()
+
+        # Show it!
+        self.show(block_command_line)        
+
     
     def _build_gui(self):
         """
@@ -432,8 +446,8 @@ class data_streamer():
             self.get_and_plot_data()
 
 
-    def hide(self):  return self.docker.hide()
-    def show(self):  return self.docker.show()
+    def hide(self):                            return self.docker.hide()
+    def show(self, block_command_line=False):  return self.docker.show(block_command_line)
     
     def reset_acquisition(self, reset_psd=True):
         
@@ -454,4 +468,5 @@ class data_streamer():
 
 
 if __name__ == '__main__':   
-    self = data_streamer([0,3])
+    self = data_streamer([0,3], block_command_line=True)
+    
