@@ -13,7 +13,7 @@ import pycrimson   as _pc
 
 
 
-class data_streamer():
+class rx_streamer():
     """
     GUI for streaming / analyzing / saving data from the Crimson. Requires
     spinmob and pyqtgraph python libraries.
@@ -68,7 +68,7 @@ class data_streamer():
         Places all the controls and plots etc, loads previous config.
         """        
         # Embeddable docker to hold GUI stuff
-        self.docker = _egg.gui.Docker('Crimson Data Streamer', autosettings_path='data_streamer_window')
+        self.docker = _egg.gui.Docker('Crimson RX Streamer', autosettings_path='data_streamer_window')
         self.docker.set_size([1000,700])
         
         # Top controls
@@ -467,6 +467,7 @@ class data_streamer():
 
 
 
-if __name__ == '__main__':   
-    self = data_streamer([0,3], block_command_line=True)
+
+# Code to run if imported / executed as a standalone script
+if __name__ == '__main__': self = rx_streamer([0,1,2,3], block_command_line=True)
     

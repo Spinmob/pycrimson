@@ -328,7 +328,7 @@ class crimson():
         # Create the buffer
         self.buffer = _data_buffer(buffer_size, len(channels))
         
-        print("pycrimson - Initializing GNU Radio with these channels enabled:")
+        print("-- pycrimson - Initializing GNU Radio with these channels enabled:")
         for n in channels: print("  "+self._channel_names[n])
         
         # Create the gnuradio top block
@@ -508,4 +508,5 @@ if __name__ == '__main__':
 
     # Show the window and start the timer.
     w.show(); t.start()
+    
     
