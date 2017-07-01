@@ -13,24 +13,6 @@
 #
 function doexit
 {
-	cat <<"!EOF!"
-
-=======================================================================
-If you have found this script useful and time-saving, consider a 
-donation to help me keep build-gnuradio, simple_ra, SIDsuite,
-meteor_detector, simple_fm_rcv, and multimode maintained and up to date.
-A simple paypal transfer to mleech@ripnet.com is all you need to do.
-======================================================================
-!EOF!
-
-	echo -n "Send success/fail info to sbrac.org?"
-	read ans
-		case $ans in
-			y|Y|YES|yes|Yes)
-				wget http://www.sbrac.org/bgrstats.php?status="$1"?systype=${SYSTYPE}?sysinfo="`uname -a`" >/dev/null 2>&1
-				echo Thanks
-				;;
-		esac
 	exit
 }
 	
@@ -94,7 +76,7 @@ export LC_LANG=C
 EXTRAS=""
 MASTER_MODE=0
 OLD_MODE=0
-PULLED_LIST="gnuradio uhd rtl-sdr gr-osmosdr gr-iqbal hackrf gr-baz bladeRF libairspy"
+PULLED_LIST="gnuradio uhd"
 which python3 >/dev/null 2>&1
 if [ $? -eq 0 ]
 then
@@ -766,7 +748,7 @@ function gitfetch {
 	esac
 		
 
-	my_echo "Fetching various packages (Gnu Radio, UHD, gr-osmosdr, gr-iqbal, etc)"
+	my_echo "Fetching various packages"
 	my_echo "  via the Internet"
 	my_echo "=======> THIS MAY TAKE QUITE SOME TIME <========="
 
@@ -861,33 +843,6 @@ function gitfetch {
 		cd ..
 	fi
 	
-	#
-	# GIT the RTL-SDR source tree
-	#
-	rm -rf rtl-sdr
-	rm -rf gr-osmosdr
-	rm  -rf gr-baz
-	rm -rf hackrf
-	rm -rf bladeRF
-	rm -rf airspy
-	my_echo Fetching rtl-sdr "(rtl-sdr, gr-osmosdr, gr-iqbal, hackrf, bladeRF and airspy)" via GIT
-	git clone --progress git://github.com/patchvonbraun/rtl-sdr >>$LOGDEV 2>&1
-	git clone --progress git://git.osmocom.org/gr-osmosdr >>$LOGDEV 2>&1
-	git clone --progress git://git.osmocom.org/gr-iqbal.git >>$LOGDEV 2>&1
-	git clone https://github.com/Nuand/bladeRF.git >>$LOGDEV 2>&1
-	if [ -d gr-iqbal ]
-	then
-		cd gr-iqbal
-		if [ $OLD_MODE -eq 1 ]
-		then
-			git checkout gr3.6
-		fi
-		git submodule init  >>$LOGDEV 2>&1
-		git submodule update >>$LOGDEV 2>&1
-		cd ..
-	fi
-	git clone --progress https://github.com/mossmann/hackrf.git >>$LOGDEV 2>&1
-	(cd $CWD; rm -rf airpsy; mkdir airspy; cd airspy; git clone https://github.com/airspy/host) >>$LOGDEV 2>&1
 	my_echo Done
 }
 
@@ -944,143 +899,7 @@ function uhd_build {
 	my_echo Done building/installing UHD
 }
 
-function rtl_build {
-	#
-	# RTL build
-	#
-	sudocheck
-	cd $CWD
-	if [ ! -d rtl-sdr ]
-	then
-		my_echo you do not appear to have the \'rtl-sdr\' directory
-		my_echo you should probably use $0 gitfetch to fetch the appropriate
-		my_echo files using GIT
-		doexit BUILD-RTL-NOT-THERE
-	fi
-	
-	my_echo -n Building rtl-sdr...
-	cd rtl-sdr
-	cmake $CMAKE_FLAG1 $CMAKE_FLAG2 $CMF1 $CMF2 . >>$LOGDEV 2>&1
-	make clean >>$LOGDEV 2>&1
-	make $JFLAG >>$LOGDEV 2>&1
 
-	if [ $? -ne 0  ]
-	then
-		my_echo rtl-sdr build apparently failed
-		my_echo Exiting rtl-sdr build
-		doexit RTL-BUILD-FAIL1
-	fi
-	sudo make $JFLAG install >>$LOGDEV 2>&1
-	my_echo Done building rtl-sdr
-	
-	cd $CWD
-	if [ -d hackrf ]
-	then
-		my_echo -n Building hackrf...
-		cd hackrf
-		cmake $CMAKE_FLAG1 $CMAKE_FLAG2 $CMF1 $CMF2 -DINSTALL_UDEV_RULES=ON host/ >>$LOGDEV 2>&1
-		make clean >>$LOGDEV 2>&1
-		make >>$LOGDEV 2>&1
-		if [ $? -ne 0 ]
-		then
-			my_echo hackrf build failed
-			my_echo Exiting hackrf build
-		else
-			sudo make install >>$LOGDEV 2>&1
-		fi
-		my_echo Done building hackrf
-		cd $CWD
-	fi
-	cd $CWD
-	if [ -d gr-iqbal ]
-	then
-		my_echo -n Building gr-iqbal...
-		cd gr-iqbal
-		mkdir -p build
-		cd build
-		cmake .. $CMAKE_FLAG1 $CMAKE_FLAG2 $CMF1 $CMF2 >>$LOGDEV 2>&1
-		make clean >>$LOGDEV 2>&1
-		make >>$LOGDEV 2>&1
-		if [ $? -ne 0 ]
-		then
-			my_echo gr-iqbal build apparently failed
-			my_echo Exiting gr-iqbal build
-		else
-			sudo make install  >>$LOGDEV 2>&1
-			cd $CWD
-			my_echo Done building gr-iqbal
-		fi
-	fi
-	if [ -d bladeRF  ]
-	then
-		my_echo -n Building bladeRF...
-		cd bladeRF
-		cd host
-		cmake . $CMAKE_FLAG1 $CMAKE_FLAG2 $CMF1 $CMF2 >>$LOGDEV 2>&1
-		make clean >>$LOGDEV 2>&1
-		make >>$LOGDEV 2>&1
-		if [ $? -ne 0 ]
-		then
-			my_echo bladeRF build apparently failed
-			my_echo Exiting bladeRF build
-		else
-			sudo make install >>$LOGDEV 2>&1
-			cd $CWD
-			my_echo Done building bladeRF
-		fi
-	fi
-	
-	if [ -d airspy/host ]
-	then
-		cd airspy/host
-		mkdir build
-		cd build
-		cmake .. $CMAKE_FLAG1 $CMAKE_FLAG2 $CMF1 $CMF2 >>$LOGDEV 2>&1
-		make clean >>$LOGDEV 2>&1
-		make >>$LOGDEV 2>&1
-		if [ $? -ne 0 ]
-		then
-			my_echo airspy build apparently failed
-			my_echo Exiting airspy build
-		else
-			sudo make install >>$LOGDEV 2>&1
-			my_echo Done building airspy
-		fi
-		cd $CWD
-	fi
-	
-
-	cd $CWD
-	if [ ! -d gr-osmosdr ]
-	then
-		my_echo you do not appear to have the \'gr-osmosdr\' directory
-		my_echo you should probably use $0 gitfetch to fetch the appropriate
-		my_echo files using GIT
-		doexit RTL-BUILD-FAIL2
-	fi
-	cd gr-osmosdr
-	if [ $OLD_MODE -eq 1 ]
-	then
-		git checkout gr3.6 >/dev/null 2>&1
-	fi
-	my_echo -n Building gr-osmosdr...
-	cmake . $CMAKE_FLAG1 $CMAKE_FLAG2 $CMF1 $CMF2 >>$LOGDEV  2>&1
-	make clean >>$LOGDEV 2>&1
-	make $JFLAG >>$LOGDEV 2>&1
-	
-	if [ $? -ne 0 ]
-	then
-		my_echo gr-osmosdr build apparently failed
-		my_echo Exit rtl-sdr/gr-osmosdr build
-		doexit OSMOSDR-BUILD-FAIL
-	fi
-	sudo make $JFLAG install >>$LOGDEV 2>&1
-	my_echo Done building gr-osmosdr
-	sudo ldconfig >>$LOGDEV 2>&1
-	
-	cd $CWD
-	my_echo Done building/installing rtl-sdr/gr-osmosdr
-}
 
 function firmware {
 	sudocheck
@@ -1345,18 +1164,6 @@ function mod_udev {
 		sudo chgrp root /etc/udev/rules.d/10-usrp.rules
 	fi
 
-	#
-	# Check for rtl-sdr UDEV rules file, update if exists
-	#
-	rm -f tmp$$
-	if [ -f $CWD/rtl-sdr/rtl-sdr.rules ]
-	then
-		sudo cp $CWD/rtl-sdr/rtl-sdr.rules /etc/udev/rules.d/15-rtl-sdr.rules
-		sudo chown root /etc/udev/rules.d/15-rtl-sdr.rules
-		sudo chgrp root /etc/udev/rules.d/15-rtl-sdr.rules
-	fi
-	sudo killall -HUP udevd
-	sudo udevadm control --reload-rules
 }
 
 function mod_sysctl {
@@ -1423,7 +1230,7 @@ function all {
 		gitfetch
 	fi
 	rm -f touch$$
-	for fcn in uhd_build firmware gnuradio_build rtl_build mod_groups mod_udev mod_sysctl pythonpath extras
+	for fcn in uhd_build firmware gnuradio_build mod_groups mod_udev mod_sysctl pythonpath extras
 	do
 		my_echo Starting function $fcn at: `date`
 		cd $CWD
